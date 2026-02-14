@@ -1,239 +1,161 @@
-const TelegramBot = require('node-telegram-bot-api');
-const fs = require('fs');
+require('dotenv').config();
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Telegraf, Markup } = require('telegraf');
+const QRCode = require('qrcode');
 
-const TOKEN = 'GANTI_TOKEN_DISINI';
-const ADMIN_ID = 123456789;
-const GROUP_ID = -1001234567890;
-const BANNER_URL = 'https://telegra.ph/file/8b3877c449c2567936761.jpg';
+const adminId = parseInt(process.env.ADMIN_ID);
+const bot = new Telegraf(process.env.BOT_TOKEN);
 
-const bot = new TelegramBot(TOKEN, { polling: true });
-const DB_FILE = 'database.json';
-const userState = {};
-
-const loadData = () => {
-    if (!fs.existsSync(DB_FILE)) return { files: [], users: [] };
-    return JSON.parse(fs.readFileSync(DB_FILE));
-};
-
-const saveData = (data) => fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-
-const registerUser = (chatId) => {
-    const data = loadData();
-    if (!data.users.includes(chatId)) {
-        data.users.push(chatId);
-        saveData(data);
+const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
     }
-};
-
-const getMainMenu = (db) => {
-    return {
-        caption: `
-🤖 *TXT CLOUD DASHBOARD*
-━━━━━━━━━━━━━━━━━━━━
-👋 *Selamat Datang*
-Sistem penyimpanan file teks berbasis cloud.
-
-📊 *Database Status:*
-📂 Total File: \`${db.files.length}\`
-👤 Total User: \`${db.users.length}\`
-
-💡 *Panduan:*
-Langsung kirim file *.txt* ke sini untuk menyimpan.
-
-👇 *Navigasi:*
-`,
-        parse_mode: 'Markdown',
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: '📂 Galeri File', callback_data: 'gallery' }],
-                [{ text: '🔄 Refresh', callback_data: 'refresh' }]
-            ]
-        }
-    };
-};
-
-bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    registerUser(chatId);
-    
-    if (userState[chatId]) delete userState[chatId];
-
-    const param = match[1];
-
-    if (param && param.startsWith('dl_')) {
-        const fileId = param.split('_')[1];
-        const db = loadData();
-        const file = db.files.find(f => f.id === fileId);
-
-        if (file) {
-            await bot.sendMessage(chatId, `⏳ *Sedang mengambil file...*`, { parse_mode: 'Markdown' });
-            await bot.sendDocument(chatId, file.file_id, { caption: `✅ *${file.name}*` });
-        } else {
-            bot.sendMessage(chatId, '❌ *File tidak ditemukan.*', { parse_mode: 'Markdown' });
-        }
-        return;
-    }
-
-    const db = loadData();
-    const menu = getMainMenu(db);
-    bot.sendPhoto(chatId, BANNER_URL, menu);
 });
 
-bot.on('document', async (msg) => {
-    const chatId = msg.chat.id;
-    const doc = msg.document;
+let state = {
+    step: 'IDLE',
+    data: {},
+    isRunning: false,
+    stopSignal: false
+};
 
-    if (!doc.file_name.endsWith('.txt') && doc.mime_type !== 'text/plain') {
-        const sent = await bot.sendMessage(chatId, '⚠️ *Format Ditolak!* Hanya menerima file .txt', { parse_mode: 'Markdown' });
-        setTimeout(() => {
-            bot.deleteMessage(chatId, msg.message_id).catch(() => {});
-            bot.deleteMessage(chatId, sent.message_id).catch(() => {});
-        }, 3000);
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+bot.use(async (ctx, next) => {
+    if (ctx.from && ctx.from.id !== adminId) {
+        await ctx.reply('⛔ <b>ACCESS DENIED</b>\nDon\'t touch this bot.', { parse_mode: 'HTML' });
         return;
     }
-
-    userState[chatId] = { step: 'NAMING', fileId: doc.file_id };
-
-    const text = `
-📝 *FILE DITERIMA*
-━━━━━━━━━━━━━━━━━━━━
-File: \`${doc.file_name}\`
-
-✍️ *Balas pesan ini dengan NAMA file.*
-`;
-
-    bot.sendMessage(chatId, text, {
-        parse_mode: 'Markdown',
-        reply_markup: {
-            inline_keyboard: [[{ text: '❌ Batal', callback_data: 'cancel_upload' }]]
-        }
-    });
+    return next();
 });
 
-bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
-    if (msg.text && msg.text.startsWith('/')) return;
-    if (!userState[chatId]) return;
+const mainMenu = Markup.inlineKeyboard([
+    [Markup.button.callback('🚀 CREATE GROUPS', 'cmd_create')],
+    [Markup.button.callback('🛑 EMERGENCY STOP', 'cmd_stop'), Markup.button.callback('📡 STATUS', 'cmd_status')],
+    [Markup.button.callback('♻️ RESET', 'cmd_reset')]
+]);
 
-    if (userState[chatId].step === 'NAMING') {
-        if (!msg.text) return;
+bot.start((ctx) => {
+    state.step = 'IDLE';
+    ctx.reply('🤖 <b>COMMAND CENTER</b>\nSystem Ready.', { parse_mode: 'HTML', ...mainMenu });
+});
 
-        const name = msg.text;
-        const fileId = userState[chatId].fileId;
-        const db = loadData();
+bot.action('cmd_reset', (ctx) => {
+    state = { step: 'IDLE', data: {}, isRunning: false, stopSignal: false };
+    ctx.reply('🔄 System Reset.', mainMenu);
+});
 
-        const newFile = {
-            id: Date.now().toString(36),
-            name: name,
-            date: new Date().toLocaleDateString(),
-            file_id: fileId,
-            uploader: msg.from.first_name
-        };
+bot.action('cmd_status', (ctx) => {
+    const status = client.info ? '✅ CONNECTED' : '❌ DISCONNECTED';
+    ctx.reply(`📡 <b>SYSTEM STATUS</b>\nWhatsApp: ${status}`, { parse_mode: 'HTML' });
+});
 
-        db.files.push(newFile);
-        saveData(db);
-        delete userState[chatId];
+bot.action('cmd_stop', (ctx) => {
+    if (!state.isRunning) return ctx.reply('⚠️ No active process.');
+    state.stopSignal = true;
+    ctx.reply('🛑 <b>STOPPING...</b>\nWaiting for current task to finish.', { parse_mode: 'HTML' });
+});
 
-        const successText = `
-✅ *BERHASIL DISIMPAN!*
-━━━━━━━━━━━━━━━━━━━━
-📂 Nama: *${name}*
-🆔 ID: \`${newFile.id}\`
+bot.action('cmd_create', (ctx) => {
+    if (!client.info) return ctx.reply('⚠️ WhatsApp not connected.');
+    if (state.isRunning) return ctx.reply('⚠️ Process already running.');
+
+    state.step = 'INPUT_NAME';
+    ctx.reply('1️⃣ Enter <b>GROUP NAME</b>:', { parse_mode: 'HTML' });
+});
+
+bot.on('text', async (ctx) => {
+    const text = ctx.message.text;
+
+    if (state.step === 'INPUT_NAME') {
+        state.data.name = text;
+        state.step = 'INPUT_NUMBERS';
+        return ctx.reply('2️⃣ Enter <b>PHONE NUMBERS</b> (Space separated):\nEx: 628123 628567', { parse_mode: 'HTML' });
+    }
+
+    if (state.step === 'INPUT_NUMBERS') {
+        const raw = text.split(' ');
+        const participants = raw.map(num => `${num.replace(/\D/g, '')}@c.us`);
+        
+        if (participants.length === 0) return ctx.reply('⚠️ Invalid numbers. Try again.');
+        
+        state.data.participants = participants;
+        state.step = 'INPUT_COUNT';
+        return ctx.reply('3️⃣ Enter <b>TOTAL GROUPS</b> (1-10):', { parse_mode: 'HTML' });
+    }
+
+    if (state.step === 'INPUT_COUNT') {
+        let count = parseInt(text);
+        if (isNaN(count) || count < 1) count = 1;
+        if (count > 10) count = 10;
+
+        state.data.count = count;
+        state.step = 'IDLE';
+
+        const summary = `
+📝 <b>TASK SUMMARY</b>
+Name: ${state.data.name} #(1-${count})
+Targets: ${state.data.participants.length} users
+Total: ${count} Groups
         `;
-        
-        await bot.sendMessage(chatId, successText, { parse_mode: 'Markdown' });
 
-        if (GROUP_ID) {
-            const me = await bot.getMe();
-            const deepLink = `https://t.me/${me.username}?start=dl_${newFile.id}`;
-            const groupMsg = `
-🔔 *FILE UPDATE*
-━━━━━━━━━━━━━━━━━━━━
-📂 *Judul:* ${name}
-👤 *Oleh:* ${msg.from.first_name}
-
-👇 *Klik tombol untuk unduh:*
-            `;
-            
-            bot.sendMessage(GROUP_ID, groupMsg, {
-                parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [[{ text: '📥 DOWNLOAD .TXT', url: deepLink }]]
-                }
-            }).catch(() => {});
-        }
-    }
-});
-
-bot.on('callback_query', async (query) => {
-    const chatId = query.message.chat.id;
-    const msgId = query.message.message_id;
-    const data = query.data;
-
-    if (data === 'cancel_upload') {
-        delete userState[chatId];
-        bot.deleteMessage(chatId, msgId);
-        bot.sendMessage(chatId, '🚫 Upload dibatalkan.');
-    }
-
-    else if (data === 'gallery') {
-        const db = loadData();
-        if (db.files.length === 0) {
-            return bot.answerCallbackQuery(query.id, { text: 'Database kosong!', show_alert: true });
-        }
-
-        const buttons = db.files.map((f) => {
-            return [{ text: `📄 ${f.name}`, callback_data: `get_${f.id}` }];
+        return ctx.reply(summary, {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('✅ EXECUTE', 'cmd_execute')],
+                [Markup.button.callback('❌ CANCEL', 'cmd_reset')]
+            ])
         });
+    }
+});
+
+bot.action('cmd_execute', async (ctx) => {
+    state.isRunning = true;
+    state.stopSignal = false;
+    const { name, participants, count } = state.data;
+
+    await ctx.reply('⚙️ <b>PROCESSING STARTED</b>', { parse_mode: 'HTML' });
+
+    for (let i = 1; i <= count; i++) {
+        if (state.stopSignal) {
+            await ctx.reply('🛑 Process Terminated by User.');
+            break;
+        }
+
+        const groupName = `${name} #${i}`;
         
-        buttons.push([{ text: '🔙 Kembali', callback_data: 'main_menu' }]);
+        try {
+            await ctx.telegram.editMessageText(ctx.chat.id, undefined, undefined, `⏳ Creating ${i}/${count}: <b>${groupName}</b>`, { parse_mode: 'HTML' });
+            
+            const res = await client.createGroup(groupName, participants);
+            
+            if (i < count) await sleep(5000);
 
-        bot.editMessageCaption('📂 *GALERI FILE TXT*\nPilih file di bawah ini:', {
-            chat_id: chatId,
-            message_id: msgId,
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: buttons }
-        }).catch(() => {}); 
-    }
-
-    else if (data === 'refresh' || data === 'main_menu') {
-        const db = loadData();
-        const menu = getMainMenu(db);
-        bot.editMessageCaption(menu.caption, {
-            chat_id: chatId,
-            message_id: msgId,
-            parse_mode: 'Markdown',
-            reply_markup: menu.reply_markup
-        }).catch(() => {});
-    }
-
-    else if (data.startsWith('get_')) {
-        const id = data.split('_')[1];
-        const db = loadData();
-        const file = db.files.find(f => f.id === id);
-
-        if (file) {
-            bot.sendMessage(chatId, `🚀 *Mengirim file...*\n📄 ${file.name}`, { parse_mode: 'Markdown' });
-            bot.sendDocument(chatId, file.file_id);
+        } catch (err) {
+            await ctx.reply(`❌ Failed ${groupName}: ${err.message}`);
         }
     }
+
+    state.isRunning = false;
+    state.data = {};
+    await ctx.reply('✅ <b>TASK COMPLETED</b>', { parse_mode: 'HTML', ...mainMenu });
 });
 
-bot.onText(/\/bc (.+)/, async (msg, match) => {
-    if (msg.chat.id !== ADMIN_ID) return;
-    const text = match[1];
-    const db = loadData();
-    let sent = 0;
-
-    bot.sendMessage(msg.chat.id, '⏳ *Sending broadcast...*', { parse_mode: 'Markdown' });
-
-    for (const uid of db.users) {
-        try {
-            await bot.sendMessage(uid, `📢 *PENGUMUMAN*\n━━━━━━━━━━━━━━━━━━━━\n${text}`, { parse_mode: 'Markdown' });
-            sent++;
-        } catch (e) {}
-    }
-    bot.sendMessage(msg.chat.id, `✅ Terkirim ke ${sent} user.`);
+client.on('qr', async (qr) => {
+    try {
+        const buffer = await QRCode.toBuffer(qr);
+        await bot.telegram.sendPhoto(adminId, { source: buffer }, { caption: '📱 <b>SCAN REQUIRED</b>', parse_mode: 'HTML' });
+    } catch (e) {}
 });
 
-console.log('BOT IS RUNNING...');
+client.on('ready', () => {
+    bot.telegram.sendMessage(adminId, '✅ <b>WHATSAPP CONNECTED</b>', { parse_mode: 'HTML' });
+});
+
+bot.launch();
+client.initialize();
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
